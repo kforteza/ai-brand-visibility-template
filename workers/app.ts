@@ -14,12 +14,6 @@ type Env = {
 	AI_GATEWAY_ID?: string;
 };
 
-type AccessContext = ExecutionContext & {
-	access?: {
-		getIdentity: () => Promise<{ email?: string | null } | null>;
-	};
-};
-
 const app = new Hono<{ Bindings: Env }>();
 
 // API routes
@@ -48,12 +42,12 @@ function authResponse(status: 401 | 403): Response {
 }
 
 export default {
-	async fetch(request: Request, env: Env, ctx: AccessContext): Promise<Response> {
+	async fetch(request: Request, env: Env, ctx: any): Promise<Response> {
 		// Fail closed: Cloudflare Access must authenticate the request AND the
 		// server-side allowlist must authorize the resulting identity.
 		if (!ctx.access) return authResponse(401);
 
-		let identity: { email?: string | null } | null = null;
+		let identity: { email?: string | null } | undefined;
 		try {
 			identity = await ctx.access.getIdentity();
 		} catch {
