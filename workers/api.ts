@@ -9,7 +9,6 @@ import {
 	SYSTEM_PROMPT,
 	SETUP_MODEL,
 } from "../src/config";
-import type { ModelConfig } from "../src/config";
 import { isApprovedDomain, normalizePublicDomain, summarizeCitations } from "./security";
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -79,6 +78,14 @@ export type QueueJob = {
 
 export const apiRoutes = new Hono<{ Bindings: Env }>();
 
+apiRoutes.use("*", async (c, next) => {
+	if (["POST", "PUT", "PATCH", "DELETE"].includes(c.req.method)) {
+		const contentLength = Number(c.req.header("content-length") ?? 0);
+		if (contentLength > 65_536) return c.json({ error: "Request body exceeds 64 KB" }, 413);
+	}
+	await next();
+});
+
 apiRoutes.use("/sites/:domain/*", async (c, next) => {
 	const domain = normalizePublicDomain(c.req.param("domain"));
 	if (!domain || !isApprovedDomain(domain, c.env.ALLOWED_DOMAINS)) return c.json({ error: "Domain is not approved" }, 403);
@@ -99,28 +106,32 @@ apiRoutes.post("/sites", async (c) => {
 		aliases?: string[];
 		description?: string;
 	}>();
-	const d = normalizePublicDomain(b.domain);
+	const d = normalizePublicDomain(typeof b.domain === "string" ? b.domain : "");
 	if (!d) return c.json({ error: "Provide a valid HTTPS domain" }, 400);
 	if (!isApprovedDomain(d, c.env.ALLOWED_DOMAINS)) return c.json({ error: "Domain is not approved" }, 403);
-	if ((b.brandName?.length ?? 0) > 120 || (b.description?.length ?? 0) > 500) return c.json({ error: "Brand name or description is too long" }, 400);
-	const aliases = (b.aliases ?? []).map((value) => value.trim()).filter(Boolean);
+	const brandName = typeof b.brandName === "string" ? b.brandName.trim() : "";
+	const description = typeof b.description === "string" ? b.description.trim() : "";
+	const aliases = Array.isArray(b.aliases) ? b.aliases.filter((value): value is string => typeof value === "string").map((value) => value.trim()).filter(Boolean) : [];
+	const competitors = Array.isArray(b.competitors) ? b.competitors.filter((value): value is string => typeof value === "string").map((value) => value.trim()).filter(Boolean) : [];
+	if (brandName.length > 120 || description.length > 500) return c.json({ error: "Brand name or description is too long" }, 400);
 	if (aliases.length > 10 || aliases.some((value) => value.length > 120)) return c.json({ error: "Use no more than 10 aliases, each up to 120 characters" }, 400);
+	if (competitors.length > 10 || competitors.some((value) => value.length > 120)) return c.json({ error: "Use no more than 10 competitor names, each up to 120 characters" }, 400);
 
 	const sites = await getSites(c.env);
 	const existing = sites.find((s) => s.domain === d);
 
 	if (existing) {
-		if (b.brandName) existing.brandName = b.brandName;
-		if (b.competitors) existing.competitors = b.competitors.slice(0, 10);
+		if (brandName) existing.brandName = brandName;
+		if (competitors.length) existing.competitors = competitors;
 		if (aliases.length) existing.aliases = aliases;
-		if (b.description) existing.description = b.description;
+		if (description) existing.description = description;
 	} else {
 		sites.push({
 			domain: d,
-			brandName: b.brandName,
-			competitors: (b.competitors ?? []).slice(0, 10),
+			brandName: brandName || undefined,
+			competitors,
 			aliases,
-			description: b.description,
+			description: description || undefined,
 			addedAt: new Date().toISOString(),
 		});
 	}
@@ -147,9 +158,9 @@ apiRoutes.get("/sites/:domain/prompts", async (c) => {
 apiRoutes.post("/sites/:domain/prompts", async (c) => {
 	const d = c.req.param("domain");
 	const b = await c.req.json<{ prompts?: string[]; prompt?: string }>();
-	const toAdd = b.prompts ?? (b.prompt ? [b.prompt] : []);
+	const toAdd = Array.isArray(b.prompts) ? b.prompts : (typeof b.prompt === "string" ? [b.prompt] : []);
 	const cur = await getPrompts(c.env, d);
-	const cleaned = toAdd.map((text) => (text || "").trim()).filter(Boolean);
+	const cleaned = toAdd.filter((text): text is string => typeof text === "string").map((text) => text.trim()).filter(Boolean);
 	if (!cleaned.length) return c.json({ error: "No prompts supplied" }, 400);
 	if (cur.length + cleaned.length > 10 || cleaned.some((text) => text.length > 500)) return c.json({ error: "A site may have at most 10 prompts; each prompt is limited to 500 characters" }, 400);
 	const newPrompts: Prompt[] = cleaned.map((text) => ({ text, active: true }));
@@ -231,6 +242,8 @@ apiRoutes.post("/sites/:domain/test", async (c) => {
 		}
 	}
 
+	if (jobs.length > 50) return c.json({ error: "Test exceeds the 50-job safety limit" }, 400);
+
 	const run: TestRun = {
 		id: testId,
 		domain: d,
@@ -245,7 +258,6 @@ apiRoutes.post("/sites/:domain/test", async (c) => {
 		expirationTtl: RETENTION_DAYS * 86400,
 	});
 
-	if (jobs.length > 50) return c.json({ error: "Test exceeds the 50-job safety limit" }, 400);
 	// Enqueue in batches of 25
 	for (let i = 0; i < jobs.length; i += 25) {
 		await c.env.BRAND_VISIBILITY_QUEUE.sendBatch(
@@ -411,9 +423,6 @@ apiRoutes.get("/setup", async (c) => {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-function clean(d: string): string {
-	return normalizePublicDomain(d) ?? "";
-}
 
 function csvE(s: string): string {
 	if (s.includes(",") || s.includes('"') || s.includes("\n")) {
