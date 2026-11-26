@@ -216,6 +216,7 @@ apiRoutes.post("/sites/:domain/test", async (c) => {
 	const prompts = allPrompts.filter((p) => p.active).map((p) => p.text);
 	if (!prompts.length) return c.json({ error: "No active prompts configured" }, 400);
 	if (prompts.length > 10) return c.json({ error: "Too many active prompts" }, 400);
+	if (!c.env.AI || !c.env.AI_GATEWAY_ID) return c.json({ error: "AI binding or isolated AI Gateway is not configured" }, 503);
 
 	const enabled = await getEnabledModels(c.env, d);
 	const models = MODELS.filter((m) => enabled.includes(m.id));
