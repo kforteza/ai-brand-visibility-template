@@ -339,13 +339,14 @@ apiRoutes.get("/results/:id/csv", async (c) => {
 		}
 	}
 
-	const hdr = "Model,Provider,Prompt,Mentioned,Excerpt,Response\n";
+	const hdr = "Model,Provider,Prompt,Status,Mentioned,Excerpt,Response\n";
 	const rows = run.citations
 		.map((ci) =>
 			[
 				ci.model,
 				ci.provider,
 				csvE(ci.prompt),
+				ci.status ?? "legacy",
 				ci.mentioned ? "Yes" : "No",
 				csvE(ci.excerpt ?? ""),
 				csvE(ci.response),
@@ -461,6 +462,7 @@ async function fetchApprovedSiteHtml(domain: string, allowlist: string): Promise
 		const response = await fetch(current.toString(), {
 			headers: { "User-Agent": "Brand-Visibility-Tester/1.0" },
 			redirect: "manual",
+			signal: AbortSignal.timeout(5000),
 		});
 		if ([301, 302, 303, 307, 308].includes(response.status)) {
 			const location = response.headers.get("location");
@@ -516,7 +518,6 @@ async function handleSetup(
 
 	try {
 		const html = await fetchApprovedSiteHtml(domain, env.ALLOWED_DOMAINS ?? "");
-		{
 			const t = html.match(/<title[^>]*>([^<]+)<\/title>/i);
 			const d = html.match(
 				/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i,
@@ -571,7 +572,6 @@ async function handleSetup(
 			]
 				.filter(Boolean)
 				.join("\n");
-		}
 	} catch {
 		fetchError = "Approved site content could not be fetched";
 	}
