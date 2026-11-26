@@ -19,6 +19,7 @@ type Env = {
 	BRAND_VISIBILITY_QUEUE: Queue;
 	TARGET_DOMAIN: string;
 	ALLOWED_DOMAINS?: string;
+	AI_GATEWAY_ID?: string;
 };
 
 type Site = {
@@ -594,7 +595,7 @@ async function handleSetup(
 		: [];
 
 	// Never return mock prompts as if a real AI analysis completed.
-	if (!env.AI) return c.json({ error: "AI binding unavailable" }, 503);
+	if (!env.AI || !env.AI_GATEWAY_ID) return c.json({ error: "AI binding or isolated AI Gateway is not configured" }, 503);
 
 	const prompt = `You are an AI visibility consultant. Generate prompts to test whether AI assistants mention a brand.
 
@@ -616,7 +617,7 @@ Respond with ONLY valid JSON:
 		const response = await env.AI.run(
 			SETUP_MODEL as Parameters<Ai["run"]>[0],
 			{ messages: [{ role: "user", content: prompt }], max_tokens: 1024 },
-			{ gateway: { id: "default" } },
+			{ gateway: { id: env.AI_GATEWAY_ID } },
 		);
 
 		const text = extractAIText(response);
