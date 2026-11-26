@@ -9,6 +9,7 @@ import { isBrandMentioned } from "./security";
 type Env = {
 	AI: Ai;
 	AEO_KV: KVNamespace;
+	AI_GATEWAY_ID?: string;
 };
 
 type Citation = {
@@ -98,8 +99,8 @@ async function executeJob(env: Env, job: QueueJob): Promise<Citation> {
  * Falls back to mock responses when AI binding is unavailable.
  */
 async function callModel(env: Env, job: QueueJob): Promise<string> {
-	// Never count a mock response as a real provider result.
-	if (!env.AI) throw new Error("AI binding unavailable");
+	// Never count a mock response as a real provider result or use a shared default gateway.
+	if (!env.AI || !env.AI_GATEWAY_ID) throw new Error("AI binding or isolated AI Gateway unavailable");
 
 	let input: any;
 
@@ -133,7 +134,7 @@ async function callModel(env: Env, job: QueueJob): Promise<string> {
 	}
 
 	const r = await env.AI.run(job.modelId as Parameters<Ai["run"]>[0], input, {
-		gateway: { id: "default" },
+		gateway: { id: env.AI_GATEWAY_ID },
 	});
 
 	return extractText(r);
