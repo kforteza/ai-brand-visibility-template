@@ -9,7 +9,7 @@ import {
 	SYSTEM_PROMPT,
 	SETUP_MODEL,
 } from "../src/config";
-import type { ModelConfig } from "../src/config";
+import { isApprovedDomain, normalizePublicDomain, summarizeCitations } from "./security";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -18,12 +18,15 @@ type Env = {
 	AEO_KV: KVNamespace;
 	BRAND_VISIBILITY_QUEUE: Queue;
 	TARGET_DOMAIN: string;
+	ALLOWED_DOMAINS?: string;
+	AI_GATEWAY_ID?: string;
 };
 
 type Site = {
 	domain: string;
 	brandName?: string;
 	competitors?: string[];
+	aliases?: string[];
 	description?: string;
 	addedAt: string;
 };
@@ -43,7 +46,7 @@ type TestRun = {
 	total: number;
 	completed: number;
 	citations: Citation[];
-	summary?: { total: number; mentioned: number; rate: number };
+	summary?: { total: number; successful: number; failed: number; mentioned: number; rate: number };
 };
 
 type Citation = {
@@ -53,6 +56,7 @@ type Citation = {
 	mentioned: boolean;
 	excerpt: string | null;
 	response: string;
+	status?: "success" | "provider_error";
 };
 
 type Prompt = {
@@ -68,11 +72,26 @@ export type QueueJob = {
 	provider: string;
 	prompt: string;
 	maxTokens: number;
+	brandTerms?: string[];
 	isGemini?: boolean;
 	isAnthropic?: boolean;
 };
 
 export const apiRoutes = new Hono<{ Bindings: Env }>();
+
+apiRoutes.use("*", async (c, next) => {
+	if (["POST", "PUT", "PATCH", "DELETE"].includes(c.req.method)) {
+		const contentLength = Number(c.req.header("content-length") ?? 0);
+		if (contentLength > 65_536) return c.json({ error: "Request body exceeds 64 KB" }, 413);
+	}
+	await next();
+});
+
+apiRoutes.use("/sites/:domain/*", async (c, next) => {
+	const domain = normalizePublicDomain(c.req.param("domain"));
+	if (!domain || !isApprovedDomain(domain, c.env.ALLOWED_DOMAINS)) return c.json({ error: "Domain is not approved" }, 403);
+	await next();
+});
 
 // ── Sites CRUD ─────────────────────────────────────────────────────────────
 
@@ -85,24 +104,35 @@ apiRoutes.post("/sites", async (c) => {
 		domain: string;
 		brandName?: string;
 		competitors?: string[];
+		aliases?: string[];
 		description?: string;
 	}>();
-	const d = clean(b.domain);
-	if (!d) return c.json({ error: "Missing domain" }, 400);
+	const d = normalizePublicDomain(typeof b.domain === "string" ? b.domain : "");
+	if (!d) return c.json({ error: "Provide a valid HTTPS domain" }, 400);
+	if (!isApprovedDomain(d, c.env.ALLOWED_DOMAINS)) return c.json({ error: "Domain is not approved" }, 403);
+	const brandName = typeof b.brandName === "string" ? b.brandName.trim() : "";
+	const description = typeof b.description === "string" ? b.description.trim() : "";
+	const aliases = Array.isArray(b.aliases) ? b.aliases.filter((value): value is string => typeof value === "string").map((value) => value.trim()).filter(Boolean) : [];
+	const competitors = Array.isArray(b.competitors) ? b.competitors.filter((value): value is string => typeof value === "string").map((value) => value.trim()).filter(Boolean) : [];
+	if (brandName.length > 120 || description.length > 500) return c.json({ error: "Brand name or description is too long" }, 400);
+	if (aliases.length > 10 || aliases.some((value) => value.length > 120)) return c.json({ error: "Use no more than 10 aliases, each up to 120 characters" }, 400);
+	if (competitors.length > 10 || competitors.some((value) => value.length > 120)) return c.json({ error: "Use no more than 10 competitor names, each up to 120 characters" }, 400);
 
 	const sites = await getSites(c.env);
 	const existing = sites.find((s) => s.domain === d);
 
 	if (existing) {
-		if (b.brandName) existing.brandName = b.brandName;
-		if (b.competitors) existing.competitors = b.competitors;
-		if (b.description) existing.description = b.description;
+		if (brandName) existing.brandName = brandName;
+		if (competitors.length) existing.competitors = competitors;
+		if (aliases.length) existing.aliases = aliases;
+		if (description) existing.description = description;
 	} else {
 		sites.push({
 			domain: d,
-			brandName: b.brandName,
-			competitors: b.competitors,
-			description: b.description,
+			brandName: brandName || undefined,
+			competitors,
+			aliases,
+			description: description || undefined,
 			addedAt: new Date().toISOString(),
 		});
 	}
@@ -113,9 +143,9 @@ apiRoutes.post("/sites", async (c) => {
 
 apiRoutes.delete("/sites", async (c) => {
 	const b = await c.req.json<{ domain: string }>();
-	const sites = (await getSites(c.env)).filter(
-		(s) => s.domain !== clean(b.domain),
-	);
+	const domain = normalizePublicDomain(b.domain);
+	if (!domain || !isApprovedDomain(domain, c.env.ALLOWED_DOMAINS)) return c.json({ error: "Domain is not approved" }, 403);
+	const sites = (await getSites(c.env)).filter((s) => s.domain !== domain);
 	await c.env.AEO_KV.put("sites", JSON.stringify(sites));
 	return c.json(sites);
 });
@@ -129,9 +159,12 @@ apiRoutes.get("/sites/:domain/prompts", async (c) => {
 apiRoutes.post("/sites/:domain/prompts", async (c) => {
 	const d = c.req.param("domain");
 	const b = await c.req.json<{ prompts?: string[]; prompt?: string }>();
-	const toAdd = b.prompts ?? (b.prompt ? [b.prompt] : []);
+	const toAdd = Array.isArray(b.prompts) ? b.prompts : (typeof b.prompt === "string" ? [b.prompt] : []);
 	const cur = await getPrompts(c.env, d);
-	const newPrompts: Prompt[] = toAdd.map((text) => ({ text, active: true }));
+	const cleaned = toAdd.filter((text): text is string => typeof text === "string").map((text) => text.trim()).filter(Boolean);
+	if (!cleaned.length) return c.json({ error: "No prompts supplied" }, 400);
+	if (cur.length + cleaned.length > 10 || cleaned.some((text) => text.length > 500)) return c.json({ error: "A site may have at most 10 prompts; each prompt is limited to 500 characters" }, 400);
+	const newPrompts: Prompt[] = cleaned.map((text) => ({ text, active: true }));
 	await c.env.AEO_KV.put(
 		`site:${d}:prompts`,
 		JSON.stringify([...cur, ...newPrompts]),
@@ -167,23 +200,30 @@ apiRoutes.get("/sites/:domain/models", async (c) => {
 apiRoutes.put("/sites/:domain/models", async (c) => {
 	const d = c.req.param("domain");
 	const b = await c.req.json<{ models: string[] }>();
-	await c.env.AEO_KV.put(`site:${d}:models`, JSON.stringify(b.models ?? []));
-	return c.json(b.models);
+	const requested = Array.isArray(b.models) ? [...new Set(b.models)] : [];
+	const allowed = requested.filter((id) => MODELS.some((model) => model.id === id));
+	if (requested.length > MODELS.length || allowed.length !== requested.length) return c.json({ error: "One or more model IDs are not allowed" }, 400);
+	await c.env.AEO_KV.put(`site:${d}:models`, JSON.stringify(allowed));
+	return c.json(allowed);
 });
 
 // ── Start test (enqueue jobs) ──────────────────────────────────────────────
 
 apiRoutes.post("/sites/:domain/test", async (c) => {
-	const d = c.req.param("domain");
+	const d = normalizePublicDomain(c.req.param("domain"));
+	if (!d || !isApprovedDomain(d, c.env.ALLOWED_DOMAINS)) return c.json({ error: "Domain is not approved" }, 403);
 	const allPrompts = await getPrompts(c.env, d);
 	const prompts = allPrompts.filter((p) => p.active).map((p) => p.text);
-	if (!prompts.length)
-		return c.json({ error: "No active prompts configured" }, 400);
+	if (!prompts.length) return c.json({ error: "No active prompts configured" }, 400);
+	if (prompts.length > 10) return c.json({ error: "Too many active prompts" }, 400);
+	if (!c.env.AI || !c.env.AI_GATEWAY_ID) return c.json({ error: "AI binding or isolated AI Gateway is not configured" }, 503);
 
 	const enabled = await getEnabledModels(c.env, d);
 	const models = MODELS.filter((m) => enabled.includes(m.id));
 	if (!models.length) return c.json({ error: "No models enabled" }, 400);
 
+	const site = (await getSites(c.env)).find((item) => item.domain === d);
+	const brandTerms = [site?.brandName, d, ...(site?.aliases ?? [])].filter((term): term is string => Boolean(term && term.trim()));
 	const testId = crypto.randomUUID();
 	const jobs: QueueJob[] = [];
 
@@ -197,11 +237,14 @@ apiRoutes.post("/sites/:domain/test", async (c) => {
 				provider: model.provider,
 				prompt,
 				maxTokens: model.maxTokens ?? 512,
+				brandTerms,
 				isGemini: model.isGemini,
 				isAnthropic: model.isAnthropic,
 			});
 		}
 	}
+
+	if (jobs.length > 50) return c.json({ error: "Test exceeds the 50-job safety limit" }, 400);
 
 	const run: TestRun = {
 		id: testId,
@@ -253,12 +296,7 @@ apiRoutes.get("/tests/:id/status", async (c) => {
 		run.status = "complete";
 		run.completed = completed;
 		run.citations = citations;
-		const mentioned = citations.filter((ci) => ci.mentioned).length;
-		run.summary = {
-			total: citations.length,
-			mentioned,
-			rate: citations.length > 0 ? mentioned / citations.length : 0,
-		};
+		run.summary = summarizeCitations(citations);
 		await c.env.AEO_KV.put(`test:${testId}`, JSON.stringify(run), {
 			expirationTtl: RETENTION_DAYS * 86400,
 		});
@@ -315,13 +353,14 @@ apiRoutes.get("/results/:id/csv", async (c) => {
 		}
 	}
 
-	const hdr = "Model,Provider,Prompt,Mentioned,Excerpt,Response\n";
+	const hdr = "Model,Provider,Prompt,Status,Mentioned,Excerpt,Response\n";
 	const rows = run.citations
 		.map((ci) =>
 			[
 				ci.model,
 				ci.provider,
 				csvE(ci.prompt),
+				ci.status ?? "legacy",
 				ci.mentioned ? "Yes" : "No",
 				csvE(ci.excerpt ?? ""),
 				csvE(ci.response),
@@ -375,22 +414,17 @@ apiRoutes.get("/models", (c) => {
 // ── Setup (AI prompt generation via gateway) ───────────────────────────────
 
 apiRoutes.get("/setup", async (c) => {
-	const domain = c.req.query("domain");
-	if (!domain) return c.json({ error: "Missing ?domain=" }, 400);
-	const brandName = c.req.query("brand") ?? "";
-	const competitors = c.req.query("competitors") ?? "";
+	const rawDomain = c.req.query("domain");
+	if (!rawDomain) return c.json({ error: "Missing ?domain=" }, 400);
+	const domain = normalizePublicDomain(rawDomain);
+	if (!domain || !isApprovedDomain(domain, c.env.ALLOWED_DOMAINS)) return c.json({ error: "Domain is not approved" }, 403);
+	const brandName = (c.req.query("brand") ?? "").slice(0, 120);
+	const competitors = (c.req.query("competitors") ?? "").slice(0, 500);
 	return handleSetup(c.env, domain, brandName, competitors, c);
 });
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-function clean(d: string): string {
-	return (d || "")
-		.toLowerCase()
-		.replace(/^https?:\/\//, "")
-		.replace(/\/.*/, "")
-		.trim();
-}
 
 function csvE(s: string): string {
 	if (s.includes(",") || s.includes('"') || s.includes("\n")) {
@@ -431,6 +465,57 @@ async function getEnabledModels(env: Env, domain: string): Promise<string[]> {
 
 // ── Setup endpoint ─────────────────────────────────────────────────────────
 
+
+async function fetchApprovedSiteHtml(domain: string, allowlist: string): Promise<string> {
+	let current = new URL(`https://${domain}/`);
+	for (let redirects = 0; redirects <= 3; redirects++) {
+		if (current.protocol !== "https:" || !isApprovedDomain(current.hostname, allowlist)) throw new Error("Unapproved fetch target");
+		const response = await fetch(current.toString(), {
+			headers: { "User-Agent": "Brand-Visibility-Tester/1.0" },
+			redirect: "manual",
+			signal: AbortSignal.timeout(5000),
+		});
+		if ([301, 302, 303, 307, 308].includes(response.status)) {
+			const location = response.headers.get("location");
+			if (!location) throw new Error("Invalid redirect");
+			const next = new URL(location, current);
+			if (next.protocol !== "https:" || !isApprovedDomain(next.hostname, allowlist)) throw new Error("Redirect target is not approved");
+			current = next;
+			continue;
+		}
+		if (!response.ok) throw new Error("Approved site returned a non-success status");
+		if (!(response.headers.get("content-type") ?? "").toLowerCase().includes("text/html")) throw new Error("Approved site did not return HTML");
+		const contentLength = Number(response.headers.get("content-length") ?? 0);
+		if (contentLength > 1_000_000) {
+			await response.body?.cancel();
+			throw new Error("Approved site response exceeds size limit");
+		}
+		if (!response.body) return "";
+		const reader = response.body.getReader();
+		const chunks: Uint8Array[] = [];
+		let total = 0;
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!value) continue;
+			total += value.byteLength;
+			if (total > 1_000_000) {
+				await reader.cancel();
+				throw new Error("Approved site response exceeds size limit");
+			}
+			chunks.push(value);
+		}
+		const bytes = new Uint8Array(total);
+		let offset = 0;
+		for (const chunk of chunks) {
+			bytes.set(chunk, offset);
+			offset += chunk.byteLength;
+		}
+		return new TextDecoder().decode(bytes);
+	}
+	throw new Error("Too many redirects");
+}
+
 async function handleSetup(
 	env: Env,
 	domain: string,
@@ -443,13 +528,7 @@ async function handleSetup(
 	let detectedBrand = "";
 
 	try {
-		const res = await fetch(`https://${domain}`, {
-			headers: { "User-Agent": "Brand-Visibility-Tester/1.0" },
-			redirect: "follow",
-		});
-
-		if (res.ok) {
-			const html = await res.text();
+		const html = await fetchApprovedSiteHtml(domain, env.ALLOWED_DOMAINS ?? "");
 			const t = html.match(/<title[^>]*>([^<]+)<\/title>/i);
 			const d = html.match(
 				/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i,
@@ -504,11 +583,8 @@ async function handleSetup(
 			]
 				.filter(Boolean)
 				.join("\n");
-		} else {
-			fetchError = `${res.status}`;
-		}
-	} catch (err) {
-		fetchError = err instanceof Error ? err.message : String(err);
+	} catch {
+		fetchError = "Approved site content could not be fetched";
 	}
 
 	const brand = brandName || detectedBrand || domain.split(".")[0];
@@ -519,32 +595,8 @@ async function handleSetup(
 				.filter(Boolean)
 		: [];
 
-	// If AI binding is not available, return mock prompts
-	if (!env.AI) {
-		console.log("AI binding not available, using mock prompts");
-		return c.json({
-			brandName: brand,
-			description: `Test prompts for ${domain}`,
-			prompts: [
-				{ text: `What is ${brand}?`, tag: "Branded" },
-				{
-					text: `How does ${brand} compare to alternatives?`,
-					tag: "Competitive",
-				},
-				{ text: `What are the key features of ${domain}?`, tag: "Category" },
-				{
-					text: `Is ${brand} a good choice for my needs?`,
-					tag: "Branded",
-				},
-				{
-					text: competitorList.length
-						? `Compare ${brand} vs ${competitorList[0]}`
-						: `What are alternatives to ${brand}?`,
-					tag: "Competitive",
-				},
-			],
-		});
-	}
+	// Never return mock prompts as if a real AI analysis completed.
+	if (!env.AI || !env.AI_GATEWAY_ID) return c.json({ error: "AI binding or isolated AI Gateway is not configured" }, 503);
 
 	const prompt = `You are an AI visibility consultant. Generate prompts to test whether AI assistants mention a brand.
 
@@ -566,7 +618,7 @@ Respond with ONLY valid JSON:
 		const response = await env.AI.run(
 			SETUP_MODEL as Parameters<Ai["run"]>[0],
 			{ messages: [{ role: "user", content: prompt }], max_tokens: 1024 },
-			{ gateway: { id: "default" } },
+			{ gateway: { id: env.AI_GATEWAY_ID } },
 		);
 
 		const text = extractAIText(response);

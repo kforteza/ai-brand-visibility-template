@@ -4,10 +4,12 @@
  */
 import { RETENTION_DAYS, SYSTEM_PROMPT } from "../src/config";
 import type { QueueJob } from "./api";
+import { isBrandMentioned } from "./security";
 
 type Env = {
 	AI: Ai;
 	AEO_KV: KVNamespace;
+	AI_GATEWAY_ID?: string;
 };
 
 type Citation = {
@@ -17,6 +19,7 @@ type Citation = {
 	mentioned: boolean;
 	excerpt: string | null;
 	response: string;
+	status: "success" | "provider_error";
 };
 
 export async function queueConsumer(
@@ -27,7 +30,14 @@ export async function queueConsumer(
 		const job = msg.body;
 		try {
 			const citation = await executeJob(env, job);
-			const citeKey = `test:${job.testId}:cite:${crypto.randomUUID().slice(0, 8)}`;
+			const digest = await crypto.subtle.digest(
+				"SHA-256",
+				new TextEncoder().encode(`${job.testId}:${job.modelId}:${job.prompt}`),
+			);
+			const suffix = Array.from(new Uint8Array(digest).slice(0, 12))
+				.map((byte) => byte.toString(16).padStart(2, "0"))
+				.join("");
+			const citeKey = `test:${job.testId}:cite:${suffix}`;
 			await env.AEO_KV.put(citeKey, JSON.stringify(citation), {
 				expirationTtl: RETENTION_DAYS * 86400,
 			});
@@ -42,15 +52,16 @@ export async function queueConsumer(
 async function executeJob(env: Env, job: QueueJob): Promise<Citation> {
 	try {
 		const text = await callModel(env, job);
-		const mentioned = text.toLowerCase().includes(job.domain);
+		const terms = job.brandTerms?.length ? job.brandTerms : [job.domain];
+		const mentioned = isBrandMentioned(text, terms);
 		let excerpt: string | null = null;
 
 		if (mentioned) {
-			const i = text.toLowerCase().indexOf(job.domain);
-			excerpt = text.slice(
-				Math.max(0, i - 100),
-				Math.min(text.length, i + job.domain.length + 100),
-			);
+			const matched = terms.find((term) => isBrandMentioned(text, [term])) ?? job.domain;
+			const i = text.toLowerCase().indexOf(matched.toLowerCase());
+			excerpt = i >= 0
+				? text.slice(Math.max(0, i - 100), Math.min(text.length, i + matched.length + 100))
+				: text.slice(0, 200);
 		}
 
 		return {
@@ -60,14 +71,15 @@ async function executeJob(env: Env, job: QueueJob): Promise<Citation> {
 			mentioned,
 			excerpt,
 			response: text.slice(0, 500),
+			status: "success",
 		};
 	} catch (err) {
 		const errMsg = err instanceof Error ? err.message : String(err);
 		const isBillingError =
 			/billing|credit|payment|insufficient|quota|budget/i.test(errMsg);
 		const response = isBillingError
-			? "Unified Billing credits required. Load credits at dash.cloudflare.com → AI Gateway → Billing."
-			: `Error: ${errMsg}`;
+			? "Provider billing or quota error; inspect protected operational logs."
+			: "Provider request failed; inspect protected operational logs.";
 
 		return {
 			model: job.modelName,
@@ -76,6 +88,7 @@ async function executeJob(env: Env, job: QueueJob): Promise<Citation> {
 			mentioned: false,
 			excerpt: null,
 			response,
+			status: "provider_error",
 		};
 	}
 }
@@ -83,14 +96,11 @@ async function executeJob(env: Env, job: QueueJob): Promise<Citation> {
 /**
  * Universal model caller — all models go through env.AI.run() with AI Gateway.
  * Handles OpenAI/Anthropic (messages format) and Gemini (contents format).
- * Falls back to mock responses when AI binding is unavailable.
+ * Requires an explicit AI binding and dedicated AI Gateway.
  */
 async function callModel(env: Env, job: QueueJob): Promise<string> {
-	// If AI binding is not available, return mock response
-	if (!env.AI) {
-		console.log("AI binding not available, using mock response");
-		return `Mock AI response from ${job.modelName}`;
-	}
+	// Never count a mock response as a real provider result or use a shared default gateway.
+	if (!env.AI || !env.AI_GATEWAY_ID) throw new Error("AI binding or isolated AI Gateway unavailable");
 
 	let input: any;
 
@@ -124,7 +134,7 @@ async function callModel(env: Env, job: QueueJob): Promise<string> {
 	}
 
 	const r = await env.AI.run(job.modelId as Parameters<Ai["run"]>[0], input, {
-		gateway: { id: "default" },
+		gateway: { id: env.AI_GATEWAY_ID },
 	});
 
 	return extractText(r);

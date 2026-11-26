@@ -2,12 +2,16 @@ import { Hono } from "hono";
 import { createRequestHandler } from "react-router";
 import { apiRoutes } from "./api";
 import { queueConsumer } from "./queue";
+import { isAuthorizedAdmin } from "./security";
 
 type Env = {
 	AI: Ai;
 	AEO_KV: KVNamespace;
 	BRAND_VISIBILITY_QUEUE: Queue;
 	TARGET_DOMAIN: string;
+	ALLOWED_ADMIN_EMAILS?: string;
+	ALLOWED_DOMAINS?: string;
+	AI_GATEWAY_ID?: string;
 };
 
 const app = new Hono<{ Bindings: Env }>();
@@ -22,11 +26,39 @@ app.get("*", (c) => {
 		import.meta.env.MODE,
 	);
 	return requestHandler(c.req.raw, {
-		cloudflare: { env: c.env, ctx: c.executionCtx },
+		cloudflare: { env: c.env, ctx: c.executionCtx as any },
 	});
 });
 
+function authResponse(status: 401 | 403): Response {
+	return new Response(status === 401 ? "Authentication required" : "Forbidden", {
+		status,
+		headers: {
+			"cache-control": "no-store",
+			"content-type": "text/plain; charset=utf-8",
+			"vary": "Cookie, Cf-Access-Jwt-Assertion",
+		},
+	});
+}
+
 export default {
-	fetch: app.fetch,
+	async fetch(request: Request, env: Env, ctx: any): Promise<Response> {
+		// Fail closed: Cloudflare Access must authenticate the request AND the
+		// server-side allowlist must authorize the resulting identity.
+		if (!ctx.access) return authResponse(401);
+
+		let identity: { email?: string | null } | undefined;
+		try {
+			identity = await ctx.access.getIdentity();
+		} catch {
+			return authResponse(401);
+		}
+
+		if (!isAuthorizedAdmin(identity?.email ?? undefined, env.ALLOWED_ADMIN_EMAILS)) {
+			return authResponse(403);
+		}
+
+		return app.fetch(request, env, ctx);
+	},
 	queue: queueConsumer,
 };

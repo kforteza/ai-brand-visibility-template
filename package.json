@@ -46,7 +46,8 @@
 		"deploy": "npm run build && wrangler deploy",
 		"dev": "react-router dev",
 		"preview": "npm run build && vite preview",
-		"typecheck": "npm run cf-typegen && react-router typegen && tsc -b"
+		"typecheck": "npm run cf-typegen && react-router typegen && tsc -p tsconfig.cloudflare.json --noEmit",
+		"test:security": "node --experimental-strip-types --test tests/security.test.mjs"
 	},
 	"type": "module"
 }
