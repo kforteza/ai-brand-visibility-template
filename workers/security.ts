@@ -1,108 +1,108 @@
 export type CitationOutcome = {
-\tmentioned: boolean;
-\tstatus?: "success" | "provider_error" | string;
-\tresponse?: string;
+  mentioned: boolean;
+  status?: "success" | "provider_error" | string;
+  response?: string;
 };
 
 export type CitationSummary = {
-\ttotal: number;
-\tsuccessful: number;
-\tfailed: number;
-\tmentioned: number;
-\trate: number;
+  total: number;
+  successful: number;
+  failed: number;
+  mentioned: number;
+  rate: number;
 };
 
 /** Accept only a bare HTTPS hostname or an HTTPS URL with no path/query/userinfo. */
 export function normalizePublicDomain(input: string): string | null {
-\tconst raw = (input || "").trim();
-\tif (!raw || raw.length > 253 || /[\s\\]/.test(raw)) return null;
+  const raw = (input || "").trim();
+  if (!raw || raw.length > 253 || /[\s\\]/.test(raw)) return null;
 
-\tlet url: URL;
-\ttry {
-\t\turl = new URL(raw.includes("://") ? raw : \`https://\${raw}\`);
-\t} catch {
-\t\treturn null;
-\t}
+  let url: URL;
+  try {
+    url = new URL(raw.includes("://") ? raw : "https://" + raw);
+  } catch {
+    return null;
+  }
 
-\tif (
-\t\turl.protocol !== "https:" ||
-\t\turl.username ||
-\t\turl.password ||
-\t\turl.port ||
-\t\t(url.pathname !== "/" && url.pathname !== "") ||
-\t\turl.search ||
-\t\turl.hash
-\t) return null;
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.port ||
+    (url.pathname !== "/" && url.pathname !== "") ||
+    url.search ||
+    url.hash
+  ) return null;
 
-\tconst host = url.hostname.toLowerCase().replace(/\.$/, "");
-\tif (
-\t\t!host.includes(".") ||
-\t\thost === "localhost" ||
-\t\thost.endsWith(".localhost") ||
-\t\thost.endsWith(".local") ||
-\t\thost.endsWith(".internal") ||
-\t\thost.endsWith(".test") ||
-\t\thost.includes(":") ||
-\t\t/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) ||
-\t\t!host.split(".").every((label) =>
-\t\t\tlabel.length > 0 &&
-\t\t\tlabel.length <= 63 &&
-\t\t\t/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)
-\t\t)
-\t) return null;
+  const host = url.hostname.toLowerCase().replace(/\.$/, "");
+  if (
+    !host.includes(".") ||
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    host.endsWith(".test") ||
+    host.includes(":") ||
+    /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) ||
+    !host.split(".").every((label) =>
+      label.length > 0 &&
+      label.length <= 63 &&
+      /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)
+    )
+  ) return null;
 
-\treturn host;
+  return host;
 }
 
 /** Exact host allowlist. Subdomains are not implicitly trusted. */
 export function isApprovedDomain(input: string, allowlist: string | undefined): boolean {
-\tconst domain = normalizePublicDomain(input);
-\tif (!domain || !allowlist?.trim()) return false;
-\tconst approved = allowlist.split(",")
-\t\t.map((item) => normalizePublicDomain(item))
-\t\t.filter((item): item is string => Boolean(item));
-\treturn approved.includes(domain);
+  const domain = normalizePublicDomain(input);
+  if (!domain || !allowlist?.trim()) return false;
+  const approved = allowlist.split(",")
+    .map((item) => normalizePublicDomain(item))
+    .filter((item): item is string => Boolean(item));
+  return approved.includes(domain);
 }
 
 export function isAuthorizedAdmin(email: string | undefined, allowlist: string | undefined): boolean {
-\tconst normalized = (email || "").trim().toLowerCase();
-\tif (!normalized || !allowlist?.trim()) return false;
-\tconst approved = allowlist.split(",")
-\t\t.map((item) => item.trim().toLowerCase())
-\t\t.filter(Boolean);
-\treturn approved.includes(normalized);
+  const normalized = (email || "").trim().toLowerCase();
+  if (!normalized || !allowlist?.trim()) return false;
+  const approved = allowlist.split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  return approved.includes(normalized);
 }
 
 function normalizeMentionText(value: string): string {
-\treturn (value || "")
-\t\t.toLowerCase()
-\t\t.replace(/https?:\/\//g, " ")
-\t\t.replace(/[^a-z0-9]+/g, " ")
-\t\t.trim()
-\t\t.replace(/\s+/g, " ");
+  return (value || "")
+    .toLowerCase()
+    .replace(/https?:\/\//g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
 export function isBrandMentioned(response: string, terms: string[]): boolean {
-\tconst haystack = \` \${normalizeMentionText(response)} \`;
-\treturn terms.some((term) => {
-\t\tconst needle = normalizeMentionText(term);
-\t\treturn needle.length > 1 && haystack.includes(\` \${needle} \`);
-\t});
+  const haystack = " " + normalizeMentionText(response) + " ";
+  return terms.some((term) => {
+    const needle = normalizeMentionText(term);
+    return needle.length > 1 && haystack.includes(" " + needle + " ");
+  });
 }
 
 /** Legacy results without status remain successful unless their response is a known error. */
 export function summarizeCitations(citations: CitationOutcome[]): CitationSummary {
-\tconst successfulRows = citations.filter((item) =>
-\t\titem.status === "success" ||
-\t\t(!item.status && !/^(error:|unified billing credits required|provider request failed)/i.test(item.response || ""))
-\t);
-\tconst failed = citations.length - successfulRows.length;
-\tconst mentioned = successfulRows.filter((item) => item.mentioned).length;
-\treturn {
-\t\ttotal: citations.length,
-\t\tsuccessful: successfulRows.length,
-\t\tfailed,
-\t\tmentioned,
-\t\trate: successfulRows.length ? mentioned / successfulRows.length : 0,
-\t};
+  const successfulRows = citations.filter((item) =>
+    item.status === "success" ||
+    (!item.status && !/^(error:|unified billing credits required|provider request failed)/i.test(item.response || ""))
+  );
+  const failed = citations.length - successfulRows.length;
+  const mentioned = successfulRows.filter((item) => item.mentioned).length;
+  return {
+    total: citations.length,
+    successful: successfulRows.length,
+    failed,
+    mentioned,
+    rate: successfulRows.length ? mentioned / successfulRows.length : 0,
+  };
 }
