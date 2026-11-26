@@ -11,6 +11,7 @@ type Env = {
 	TARGET_DOMAIN: string;
 	ALLOWED_ADMIN_EMAILS?: string;
 	ALLOWED_DOMAINS?: string;
+	AI_GATEWAY_ID?: string;
 };
 
 type AccessContext = ExecutionContext & {
